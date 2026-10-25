@@ -17,6 +17,15 @@
 
 ---
 
+## How we use Convex
+
+- **Whole backend:** HTTP actions serve the call API plus Cartesia's webhook and five agent tools (`convex/http.ts`, `convex/phone.ts`).
+- **Live captions:** a realtime subscription updates the call screen and judges' dashboard without a refresh (`convex/live.ts`).
+- **Background work:** scheduled functions run Jev checks; crons expire encrypted PINs and clean up call data (`convex/crons.ts`).
+- **Hosting:** the web app is served from Convex file storage (`convex/site.ts`). Details and commit log: [hackathon.md](hackathon.md).
+
+---
+
 ## What it is
 
 **call4me** is a mobile web app plus a voice agent that makes a customer service call for you, start to finish. You type what you want and what it's not allowed to agree to. The agent dials, presses through the phone menu, waits on hold, and talks to the person who answers. You follow the whole call as large live captions, and step in only when it needs something only you know.
