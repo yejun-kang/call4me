@@ -12,7 +12,7 @@
 - **Auth:** Other (shared access-code and worker tokens checked in `convex/lib/auth.ts` and `convex/phone.ts`)
 - **AI models:** `claude-haiku-4.5`, `claude-sonnet-5-5`, `jev-latest`, `ink-whisper`, `sonic-2`
 - **Started:** 2026-10-24T02:28:02Z
-- **Last updated:** 2026-10-25T15:06:45Z
+- **Last updated:** 2026-10-25T15:12:39Z
 
 ## How we use Convex
 
