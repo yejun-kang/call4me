@@ -56,7 +56,7 @@ Be honest about this split in the pitch and in code comments: the strongest guar
 
 ## 3. Architecture
 
-Current production: phone browser → Convex HTTP actions + subscriptions → Cartesia managed agent. `convex/phone.ts` handles calls and tools; `convex/managed.ts` records state; `convex/site.ts` serves the static export from file storage.
+Current production: phone browser → Convex HTTP actions + subscriptions → Cartesia managed agent. `convex/phone.ts` handles calls and tools; `convex/jev.ts` asks TypeSafe for menu and state decisions; `convex/jevWatch.ts` runs background state checks from company captions; `convex/managed.ts` records state and decisions; `convex/site.ts` serves the static export from file storage.
 
 The retained **legacy Python/Azure architecture** is:
 
@@ -77,8 +77,9 @@ Backend (Python, FastAPI) on Azure Container Apps, exactly 1 replica
   │    listens, thinks (Claude via Cartesia), speaks, presses keys.
   │    We get every utterance by webhook (POST /cartesia/webhook) and answer
   │    its tools (POST /cartesia/tools/{name}): ask_user, check_offer,
-  │    report_state, finish. The managed agent chooses menu options and
-  │    presses keys with its built-in send_dtmf tool.
+  │    menu_choice, report_state, finish. Jev chooses menu options;
+  │    the managed agent presses keys with its built-in send_dtmf tool.
+  │    Jev also watches company captions before a person answers.
   │
   └─ TELEPHONY=phone (backup demo, no phone network)
        Our own pipeline against the fake support line:
@@ -92,7 +93,7 @@ With `USE_MOCKS=true` every external service is mocked and calls go to an in-pro
 ### Who does what
 - **Cartesia:** in `cartesia` mode, the whole call (telephony, listening, speaking, DTMF) via a Managed Agent whose model is Claude (`CARTESIA_AGENT_MODEL`, default `claude-haiku-4.5`). In `phone` mode, ears (STT) and voice (Sonic TTS).
 - **Claude:** the conversation with the rep in both modes (through Cartesia's agent, or our own tool-use loop via the Anthropic API in phone mode, default `claude-sonnet-5-5`), the greeting, caption summaries, and the post-call summary.
-- **Jev (TypeSafe):** fast typed decisions with probabilities in `phone` mode: call state every 2–3 s, menu option choice, human detection and confirmation. Falls back to keyword heuristics without `TYPESAFE_API_KEY` (or if it doesn't answer within 2 s). Cartesia mode uses the managed agent's menu selection and state reports; it has no Jev watcher or `call4me_menu_choice` tool.
+- **Jev (TypeSafe):** typed decisions with probabilities in both modes. Managed Cartesia calls use `call4me_menu_choice` for menu options and a background watcher for company captions before a person answers. The legacy `phone` pipeline also uses audio labels, periodic state checks and human confirmation. Production reads `TYPESAFE_API_KEY` from Convex; a missing key, provider error or two-second timeout falls back to keyword heuristics. Convex events record `source: "jev"` or `source: "heuristic"` plus a fallback reason, so a successful tone does not by itself prove Jev chose it.
 - **Convex:** production hosting, HTTP actions, call state and live subscriptions. It is also an optional store for the legacy Python worker when `STORAGE_BACKEND=convex`. See section 9.
 - **Azure (legacy):** hosting, PostgreSQL, Key Vault, Application Insights. `AZURE_FOUNDRY_*` settings exist but Claude is not routed through Foundry.
 
@@ -106,7 +107,7 @@ With `USE_MOCKS=true` every external service is mocked and calls go to an in-pro
 | Storage | Convex in production; PostgreSQL + SQLAlchemy or Convex for the legacy Python worker |
 | Telephony | Cartesia Managed Agents (real calls); `/phone` browser page + mock line (backup) |
 | Speech | Cartesia STT and Sonic TTS (phone mode); Cartesia agent voice (`CARTESIA_VOICE_ID`) |
-| Decisions | Jev via `typesafe-sdk` (model `jev-latest`) in phone mode; managed agent in Cartesia mode |
+| Decisions | Jev `jev-latest` via the TypeSafe Choice HTTP API in Convex; `typesafe-sdk` in the legacy Python modes |
 | Conversation | Claude via the Anthropic SDK (tool use) |
 | Audio | numpy, soxr; energy VAD and a time-domain music/speech classifier (lightweight stand-ins for Silero and YAMNet) |
 | Web app | Next.js (App Router, TypeScript) + Tailwind, static export in `web/out` |
@@ -182,10 +183,12 @@ Legacy Python transitions go through `engine/states.py`; Convex transitions use 
 **Human detection (latency-critical):** Jev flags `human` with high confidence → play the **pre-generated** greeting → confirm by a natural response from the rep (recordings don't respond) → visual alert on the user's screen. Target: agent speaks within ~1.5 s of the rep's greeting.
 
 ### Cartesia mode (`convex/phone.ts`; legacy `backend/cartesia/call.py`)
-- **The managed agent picks menu keys:** it chooses the option that fits the goal and invokes built-in `send_dtmf` (or says the requested word). There is no backend menu-choice step.
+- **Jev picks menu options:** the managed agent calls `call4me_menu_choice` with the options it heard. Convex asks TypeSafe which option fits the goal, records its probability and source, then returns the selected key or word. Cartesia invokes built-in `send_dtmf` (or says the requested word). The menu tool does not wait for a separate state classification before returning its action.
 - Keypad requests use `send_dtmf` for known info or an `ask_user` answer with `delivery="dtmf"`. The agent is instructed not to narrate decisions to automated systems; `send_dtmf` and `skip_turn` have pre-tool speech off.
-- **The agent reports state:** it stays silent on hold (`skip_turn`) and calls `call4me_report_state` with `menu | hold | person`. The note is used as the transition reason; state changes go through the shared recorder.
-- Per-turn webhooks produce redacted live captions and record observed `send_dtmf` calls as `menu_action` events. This mode does not produce Jev decisions, confidence scores, or disagreement events.
+- **Jev watches company speech before a person answers:** the webhook schedules a check of the last four remote captions. Confident results update state (0.6 for automated states; 0.75 for a person). Once in conversation, the watcher stops until the agent reports a menu or hold again. Late results cannot overwrite newer company speech or state changes.
+- **The agent also reports state:** it stays silent on hold (`skip_turn`) and calls `call4me_report_state` with `menu | hold | person`. The note is used as the transition reason; a conflicting recent confident Jev result produces a disagreement event rather than blocking the agent's report.
+- Per-turn webhooks produce redacted live captions and record observed `send_dtmf` calls as `menu_action` events. Jev checks produce `jev_decision` events and `jev.decision` audit entries with confidence, source and fallback metadata. Convex deduplicates webhook turns when Cartesia supplies a turn ID.
+- This restoration keeps Haiku 4.5, the existing voice, silent DTMF/PIN delivery and the mobile PIN keyboard behavior.
 - `call_completed` / `call_failed` webhooks end the call. Production writes go directly to Convex; the legacy worker uses its selected SQL or Convex store.
 
 ---
@@ -204,12 +207,13 @@ Runs in `IN_CONVERSATION`. Each rep turn: final STT transcript → Claude → to
 | `request_takeover(reason)` | Ask the user to take over (e.g., high-sensitivity info) |
 
 ### Cartesia mode: webhook tools (`cartesia/spec.py`)
-The agent's instructions carry the goal, limits, disclosure wording, info the user chose to share, and the rules above. Its four webhook tools call back into our server:
+The agent's instructions carry the goal, limits, disclosure wording, info the user chose to share, and the rules above. Its five webhook tools call back into our server:
 
 | Tool | Purpose |
 |---|---|
 | `call4me_ask_user(question, sensitivity, delivery?)` | Ask the user; waits up to ~95 s. Delivery defaults to speech; explicit keypad requests use `dtmf` |
 | `call4me_check_offer(kind, description, amount_usd)` | Decide in code whether the limits allow a charge, plan change, cancellation, or anything outside the goal |
+| `call4me_menu_choice(options)` | Ask Jev for a menu option; return the chosen key for native `send_dtmf` or a requested spoken word |
 | `call4me_report_state(state, note)` | Update the user's screen: menu, hold, or person |
 | `call4me_finish(summary, …)` | Record the outcome for the summary screen |
 | built-in `send_dtmf`, `skip_turn`, `end_call` | Keys, staying silent on hold, hanging up |
@@ -318,7 +322,7 @@ Production Convex settings are listed in [the deployment guide](docs/convex-alwa
 TELEPHONY=cartesia            # cartesia | phone | (empty: mock with USE_MOCKS, else cartesia)
 PUBLIC_BASE_URL=              # public https URL for Cartesia webhooks (Azure URL or cloudflared)
 CARTESIA_API_KEY=  CARTESIA_VOICE_ID=  CARTESIA_AGENT_MODEL=claude-haiku-4.5
-TYPESAFE_API_KEY=             # Jev, phone mode (keyword heuristics without it)
+TYPESAFE_API_KEY=             # Jev in both modes (keyword heuristics without it)
 ANTHROPIC_API_KEY=            # Claude, phone mode
 API_TOKEN=                    # empty = open (local dev); deploy.sh generates one
 STORAGE_BACKEND=sql           # or convex (+ CONVEX_URL, CONVEX_BACKEND_TOKEN)
@@ -327,7 +331,7 @@ USE_MOCKS=false
 APNS_*                        # paid Apple account only; leave empty
 ```
 
-Never commit secrets. Current production reads Convex environment variables; the legacy Azure worker loads secrets from Key Vault.
+Never commit secrets. Current production reads Convex environment variables, including `TYPESAFE_API_KEY`; changing a laptop `.env` does not change the deployed value. The legacy Azure worker loads secrets from Key Vault. After deploying the Convex endpoints, run `PYTHONPATH=. .venv/bin/python scripts/enable_cartesia_jev.py` for a dry run, then add `--apply` to restore the existing agent's menu-choice tool and instruction. See the deployment guide for the complete sequence.
 
 ---
 
@@ -387,7 +391,7 @@ For current production use [Convex always-on deployment](docs/convex-always-on.m
 
 ## 18. Status
 
-Done: Convex-hosted mobile app, call API and managed Cartesia tools without a laptop server; encrypted temporary answers and live subscriptions. Retained legacy functionality: fake support line, phone-mode pipeline (audio, STT, Jev engine, menu navigation, Claude agent, guard, TTS), takeover, phone-mode evals (11/11), Python SQL/Convex storage and Azure deployment tooling.
+Done: Convex-hosted mobile app, call API and managed Cartesia tools without a laptop server; restored Jev menu choices and background state checks; encrypted temporary answers and live subscriptions. Automated managed-call tests cover the HTTP-to-TypeSafe path with an intercepted provider response, state transitions, stale-result handling and PIN delivery; they do not establish carrier audio behavior. Retained legacy functionality: fake support line, phone-mode pipeline (audio, STT, Jev engine, menu navigation, Claude agent, guard, TTS), takeover, phone-mode evals (11/11), Python SQL/Convex storage and Azure deployment tooling.
 
 Shelved: native iOS app, Live Activities, APNs push (needs a paid Apple account). Stretch: web push.
 

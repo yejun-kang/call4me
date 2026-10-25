@@ -1,7 +1,18 @@
 import { internalMutation, internalQuery } from "./_generated/server";
 import type { MutationCtx } from "./_generated/server";
 import { v } from "convex/values";
-import { records } from "./schema";
+import { jevDecision, records } from "./schema";
+import { internal } from "./_generated/api";
+import type { Decision } from "./jev";
+
+const PRE_PERSON = new Set(["DIALING", "MENU", "HOLD", "RECORDED_MESSAGE", "CALLBACK_OFFERED"]);
+const JEV_TO_STATE: Record<string, string> = {
+  menu: "MENU", recorded_message: "RECORDED_MESSAGE", hold_music: "HOLD",
+  callback_offer: "CALLBACK_OFFERED", human: "IN_CONVERSATION",
+};
+const JEV_TO_REPORT: Record<string, string> = {
+  menu: "menu", recorded_message: "hold", hold_music: "hold", callback_offer: "hold", human: "person",
+};
 
 const now = () => new Date().toISOString();
 const id = () => crypto.randomUUID().replaceAll("-", "");
@@ -20,10 +31,10 @@ async function publish(ctx: MutationCtx, sessionId: string, type: "caption" | "s
     .withIndex("by_session_sequence", q => q.eq("session_id", sessionId)).order("desc").take(420);
   for (const row of old.slice(400)) await ctx.db.delete(row._id);
 }
-async function event(ctx: MutationCtx, sessionId: string, kind: string, detail: Record<string, unknown>, from: string | null, to: string | null) {
+async function event(ctx: MutationCtx, sessionId: string, kind: string, detail: Record<string, unknown>, from: string | null, to: string | null, confidence: number | null = null) {
   await ctx.db.insert("call_event", {
     id: id(), session_id: sessionId, at: now(), kind,
-    from_state: from, to_state: to, confidence: null, detail_json: detail,
+    from_state: from, to_state: to, confidence, detail_json: detail,
   });
 }
 async function auditEvent(ctx: MutationCtx, actor: string, action: string, subject: string,
@@ -33,12 +44,14 @@ async function auditEvent(ctx: MutationCtx, actor: string, action: string, subje
     diff_json: {}, evidence_json: evidence,
   });
 }
-async function changeState(ctx: MutationCtx, sessionId: string, to: string, reason: string) {
+async function changeState(ctx: MutationCtx, sessionId: string, to: string, reason: string, actor = "agent", confidence: number | null = null) {
   const call = await session(ctx, sessionId);
   if (!call || call.state === to || ["ENDED", "FAILED"].includes(call.state)) return;
   await ctx.db.patch(call._id, { state: to });
-  await event(ctx, sessionId, "transition", { reason, actor: "agent" }, call.state, to);
-  await auditEvent(ctx, "agent", "call.transition", sessionId, reason);
+  const managed = await ctx.db.query("managed_call").withIndex("by_session", q => q.eq("session_id", sessionId)).unique();
+  if (managed) await ctx.db.patch(managed._id, { state_version: (managed.state_version ?? 0) + 1 });
+  await event(ctx, sessionId, "transition", { reason, actor }, call.state, to, confidence);
+  await auditEvent(ctx, actor, "call.transition", sessionId, reason);
   await publish(ctx, sessionId, "state", { from: call.state, to, reason });
 }
 
@@ -125,7 +138,7 @@ export const managed = internalQuery({
       .withIndex("by_external_id", q => q.eq("id", args.session_id)).unique();
     return row && call ? { provider_call_id: row.provider_call_id,
       recorded_outcome: row.recorded_outcome, recorded_reference: row.recorded_reference,
-      call: { id: call.id, user_id: call.user_id, state: call.state,
+      call: { id: call.id, user_id: call.user_id, state: call.state, goal: call.goal,
         limits_json: call.limits_json, started_at: call.started_at } } : null;
   },
 });
@@ -136,6 +149,14 @@ export const transition = internalMutation({
     const call = await session(ctx, args.session_id);
     if (!call) return;
     const reason = args.reason.slice(0, 200);
+    const managed = await ctx.db.query("managed_call").withIndex("by_session", q => q.eq("session_id", args.session_id)).unique();
+    const last = managed?.jev_last_state;
+    const reported = ({ MENU: "menu", HOLD: "hold", IN_CONVERSATION: "person" } as Record<string, string>)[args.to];
+    if (reported && last && last.probability >= 0.6 && JEV_TO_REPORT[last.choice] && JEV_TO_REPORT[last.choice] !== reported) {
+      const detail = { agent: reported, jev: last.choice, probability: last.probability, source: last.source };
+      await event(ctx, args.session_id, "jev_disagreement", detail, null, null);
+      await publish(ctx, args.session_id, "event", { kind: "jev_disagreement", ...detail });
+    }
     if (args.to === "IN_CONVERSATION" &&
       ["DIALING", "MENU", "HOLD", "RECORDED_MESSAGE", "CALLBACK_OFFERED"].includes(call.state)) {
       for (const state of ["HUMAN_SUSPECTED", "HUMAN_CONFIRMED", "IN_CONVERSATION"])
@@ -149,12 +170,76 @@ export const transition = internalMutation({
 });
 
 export const caption = internalMutation({
-  args: { session_id: v.string(), speaker: v.string(), text: v.string() },
+  args: { session_id: v.string(), speaker: v.string(), text: v.string(), turn_id: v.optional(v.string()) },
   handler: async (ctx, args) => {
-    if (!await session(ctx, args.session_id)) return;
+    const call = await session(ctx, args.session_id);
+    if (!call) return;
+    const managed = await ctx.db.query("managed_call").withIndex("by_session", q => q.eq("session_id", args.session_id)).unique();
+    if (managed && args.turn_id) {
+      if (managed.seen_turn_ids?.includes(args.turn_id)) return;
+      await ctx.db.patch(managed._id, { seen_turn_ids: [...(managed.seen_turn_ids ?? []), args.turn_id].slice(-100) });
+    }
     const detail = { speaker: args.speaker, text: args.text };
     await event(ctx, args.session_id, "caption", detail, null, null);
     await publish(ctx, args.session_id, "caption", { ...detail, final: true });
+    if (managed && args.speaker === "remote") {
+      const sequence = (managed.remote_sequence ?? 0) + 1;
+      await ctx.db.patch(managed._id, {
+        remote_window: [...(managed.remote_window ?? []), args.text].slice(-4), remote_sequence: sequence,
+      });
+      // Match the old background watcher: acknowledging Cartesia never waits on Jev.
+      if (PRE_PERSON.has(call.state)) await ctx.scheduler.runAfter(0, internal.jevWatch.classify, { session_id: args.session_id, sequence });
+    }
+  },
+});
+
+export type JevContext = {
+  goal: string; state: string; transcript: string; latest: string; sequence: number; state_version: number;
+};
+export const jevContext = internalQuery({
+  args: { session_id: v.string() },
+  handler: async (ctx, args): Promise<JevContext | null> => {
+    const managed = await ctx.db.query("managed_call").withIndex("by_session", q => q.eq("session_id", args.session_id)).unique();
+    const call = await ctx.db.query("call_session").withIndex("by_external_id", q => q.eq("id", args.session_id)).unique();
+    if (!managed || !call || ["ENDED", "FAILED"].includes(call.state)) return null;
+    const remote = managed.remote_window ?? [];
+    return { goal: call.goal, state: call.state, transcript: remote.join(" "), latest: remote.at(-1) ?? "",
+      sequence: managed.remote_sequence ?? 0, state_version: managed.state_version ?? 0 };
+  },
+});
+
+export const jevRecord = internalMutation({
+  args: { session_id: v.string(), decision: jevDecision, reason: v.string(),
+    sequence: v.optional(v.number()), state_version: v.optional(v.number()), summary: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    const call = await session(ctx, args.session_id);
+    const managed = await ctx.db.query("managed_call").withIndex("by_session", q => q.eq("session_id", args.session_id)).unique();
+    if (!call || !managed || ["ENDED", "FAILED"].includes(call.state)) return false;
+    const d: Decision = args.decision;
+    const current = args.sequence === (managed.remote_sequence ?? 0) && args.state_version === (managed.state_version ?? 0);
+    // A parallel report_state("menu") or Jev watcher may advance DIALING→MENU
+    // while this same menu is being decided. That must not delay a valid key.
+    const sameMenu = args.sequence === (managed.remote_sequence ?? 0) &&
+      (args.state_version === (managed.state_version ?? 0) || PRE_PERSON.has(call.state));
+    if (d.question === "menu_choice" && !sameMenu) return false;
+    const target = d.question === "state_check" ? JEV_TO_STATE[d.choice] : undefined;
+    const apply = !!target && current && PRE_PERSON.has(call.state) &&
+      d.probability >= (target === "IN_CONVERSATION" ? 0.75 : 0.6) && target !== call.state;
+    const count = (managed.jev_count ?? 0) + 1;
+    await ctx.db.patch(managed._id, { jev_count: count,
+      ...(d.question === "state_check" && current ? { jev_last_state: d } : {}) });
+    const detail = { question: d.question, choice: d.choice, probability: d.probability,
+      count, state: call.state, reason: args.reason, fallback: d.source !== "jev", source: d.source,
+      ...(d.fallback_reason ? { fallback_reason: d.fallback_reason } : {}), applied: apply };
+    await event(ctx, args.session_id, "jev_decision", detail, null, null, d.probability);
+    await auditEvent(ctx, d.source, "jev.decision", args.session_id, args.reason, true, detail);
+    await publish(ctx, args.session_id, "event", { kind: "jev_decision", ...detail });
+    if (apply) {
+      const states = target === "IN_CONVERSATION" ? ["HUMAN_SUSPECTED", "HUMAN_CONFIRMED", target] : [target];
+      for (const state of states) await changeState(ctx, args.session_id, state, `${d.source}: ${d.choice}`, d.source, d.probability);
+    }
+    if (args.summary) await publish(ctx, args.session_id, "summary", { text: args.summary });
+    return true;
   },
 });
 

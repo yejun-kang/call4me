@@ -67,6 +67,7 @@ Phone browser: static web app on Convex .site ── REST + subscriptions ──
 Judges view (/dashboard/)                                           ├─ HTTP actions: calls, tools, webhooks
                                                                     ├─ call state, audit, live captions
                                                                     ├─ encrypted short-lived answer mailbox
+                                                                    ├─ Jev (TypeSafe): menu choices and state checks
                                                                     ▼
                                               Cartesia: managed voice agent and phone line
 ```
@@ -84,10 +85,14 @@ phone-mode pipeline remains in this repository for local tests and backup demos.
    passed as dynamic variables. The agent's instructions and voice remain in Cartesia.
 3. **The agent dials the company** from a Cartesia phone number, presses through the
    menu, waits on hold, and talks to the rep. It starts by saying it's an AI calling for
-   you. The managed agent chooses menu options and calls its built-in `send_dtmf` tool.
+   you. It asks Jev for menu choices through `call4me_menu_choice`, then sends the
+   returned key with Cartesia's built-in `send_dtmf` tool.
 4. **Every utterance comes back as captions.** Cartesia sends each line to our webhook;
-   Convex redacts it, saves it, and streams it to your phone with a subscription.
-5. **When the agent needs you, it calls a tool on our backend:**
+   Convex applies caption redaction, saves it, and streams it to your phone with a
+   subscription. Before a person answers, a background Jev check classifies recent
+   company speech as a menu, recording, hold, or person.
+5. **The agent uses five tools on our backend:**
+   - `menu_choice`: asks Jev which menu option fits the goal and returns the key or word
    - `ask_user`: puts a question on your screen and waits for your typed answer;
      explicit keypad requests use DTMF instead of reading the answer aloud
    - `check_offer`: tests any fee, offer, or plan change against your limits
@@ -101,7 +106,8 @@ See [Convex always-on deployment](docs/convex-always-on.md) for setup and verifi
 
 ### Two ways to place a call
 
-Chosen with `TELEPHONY`:
+Production uses managed Cartesia calls. The legacy Python worker selects its mode
+with `TELEPHONY`:
 
 | Mode | What dials | Who is the rep | Use it for |
 |---|---|---|---|
@@ -121,10 +127,13 @@ With `USE_MOCKS=true` every service is mocked and calls go to an in-process fake
   opening disclosure and the post-call summary.
 - **Guard layer: limits in code.** In our own pipeline, every sentence passes
   `backend/agent/guard.py` before it's spoken. It runs in under 10 ms.
-- **Jev (TypeSafe): knowing what's on the line in phone mode.** Jev classifies each
-  stretch of audio (menu, hold music, silence, a person, voicemail), picks the menu option
-  that matches the goal, and confirms a human is there before the agent speaks. A hard
-  timeout falls back to a safe default, so the call never stalls.
+- **Jev (TypeSafe): menu choices and call-state decisions.** In production, Convex
+  asks Jev which menu option matches the goal and classifies recent company captions
+  in the background until a person answers. Cartesia sends the selected keypad tones.
+  The legacy phone pipeline also uses Jev with transcript and audio-label context.
+  Production reads `TYPESAFE_API_KEY` from Convex; a two-second timeout or provider
+  error uses keyword heuristics, recorded as `source: "heuristic"` rather than
+  `source: "jev"` in the decision events and audit log.
 - **Convex: the always-on backend.** HTTP actions serve the static app, start calls,
   receive Cartesia callbacks and tool calls, and hold encrypted answers briefly. Call
   records, audit events and redacted captions stream through Convex subscriptions.

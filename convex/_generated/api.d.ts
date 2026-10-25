@@ -10,6 +10,8 @@
 
 import type * as crons from "../crons.js";
 import type * as http from "../http.js";
+import type * as jev from "../jev.js";
+import type * as jevWatch from "../jevWatch.js";
 import type * as lib_auth from "../lib/auth.js";
 import type * as live from "../live.js";
 import type * as maintenance from "../maintenance.js";
@@ -27,6 +29,8 @@ import type {
 declare const fullApi: ApiFromModules<{
   crons: typeof crons;
   http: typeof http;
+  jev: typeof jev;
+  jevWatch: typeof jevWatch;
   "lib/auth": typeof lib_auth;
   live: typeof live;
   maintenance: typeof maintenance;

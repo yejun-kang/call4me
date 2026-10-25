@@ -3,6 +3,11 @@ import { v } from "convex/values";
 
 const nullableString = v.union(v.string(), v.null());
 const nullableNumber = v.union(v.number(), v.null());
+export const jevDecision = v.object({
+  question: v.union(v.literal("state_check"), v.literal("menu_choice")),
+  choice: v.string(), probability: v.number(), alternatives: v.record(v.string(), v.number()),
+  source: v.union(v.literal("jev"), v.literal("heuristic")), fallback_reason: v.optional(v.string()),
+});
 export const records = {
   call_session: v.object({
     id: v.string(), user_id: v.string(), company: v.string(), phone_number: v.string(),
@@ -63,6 +68,9 @@ export default defineSchema({
     session_id: v.string(), provider_call_id: nullableString,
     recorded_outcome: nullableString, recorded_reference: nullableString,
     provider_deleted_at: nullableString,
+    remote_window: v.optional(v.array(v.string())), remote_sequence: v.optional(v.number()),
+    state_version: v.optional(v.number()), jev_count: v.optional(v.number()),
+    jev_last_state: v.optional(jevDecision), seen_turn_ids: v.optional(v.array(v.string())),
   }).index("by_session", ["session_id"])
     .index("by_provider", ["provider_call_id"])
     .index("by_deleted", ["provider_deleted_at"]),

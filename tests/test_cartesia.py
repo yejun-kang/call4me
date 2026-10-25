@@ -18,8 +18,10 @@ from backend import calls
 from backend.cartesia import setup as cartesia_setup
 from backend.cartesia import spec
 from backend.cartesia.api import CartesiaAgentsApi
-from backend.cartesia.call import CartesiaCall, by_call_id
+from backend.cartesia.call import CartesiaCall, _agent_menu, by_call_id
 from backend.contracts import CallLimits, CallSession, CallState, UserRequestStatus
+from backend.engine import jev_checks
+from backend.engine.jev_checks import MockDecisionClient
 from backend.notify.live import answers, hub
 
 SETTINGS = SimpleNamespace(
@@ -112,13 +114,16 @@ def session(**limits: Any) -> CallSession:
     )
 
 
-async def started_call(fake: FakeCartesia, **limits: Any) -> CartesiaCall:
+async def started_call(
+    fake: FakeCartesia, decisions: MockDecisionClient | None = None, **limits: Any
+) -> CartesiaCall:
     await cartesia_setup.ensure(SETTINGS, fake.api())
     call = CartesiaCall(
         session(**limits),
         settings=SETTINGS,
         known_info={"Order number": ORDER},
         api=fake.api(),
+        decisions=decisions,
         persist=False,
     )
     calls.registry[call.id] = call
@@ -135,6 +140,7 @@ async def test_setup_creates_everything_once_then_updates(fake: FakeCartesia) ->
     assert [t["name"] for t in fake.tools] == [
         "call4me_ask_user",
         "call4me_check_offer",
+        "call4me_menu_choice",
         "call4me_report_state",
         "call4me_finish",
     ]
@@ -156,7 +162,7 @@ async def test_setup_creates_everything_once_then_updates(fake: FakeCartesia) ->
 
     n_requests = len(fake.requests)
     await cartesia_setup.ensure(SETTINGS, fake.api())  # idempotent: no new resources
-    assert len(fake.agents) == 1 and len(fake.tools) == 4 and len(fake.numbers) == 1
+    assert len(fake.agents) == 1 and len(fake.tools) == 5 and len(fake.numbers) == 1
     assert len(fake.requests) > n_requests
 
 
@@ -513,6 +519,175 @@ async def test_cancel_cancels_the_cartesia_call(fake: FakeCartesia) -> None:
     await call.cancel()
     assert fake.cancelled == ["ac_1"]
     await call.finish({"status": "completed", "end_reason": "api_cancelled"})
+
+
+# --- Jev alongside the agent ---------------------------------------------------------
+
+
+async def company_says(call: CartesiaCall, text: str) -> None:
+    await call.on_event(
+        {"type": "call_turn", "call_id": "ac_1", "turn": {"role": "user", "text": text}}
+    )
+    for _ in range(5):
+        await asyncio.sleep(0)
+    async with call._jev_lock:  # FIFO: queued checks have finished
+        pass
+
+
+def jev_events(call: CartesiaCall) -> list[Any]:
+    return [e for e in call.recorder.events if e.kind == "jev_decision"]
+
+
+async def test_jev_classifies_company_speech_and_moves_the_state(fake: FakeCartesia) -> None:
+    call = await started_call(fake)  # no TYPESAFE key: Jev's keyword twin answers
+    await company_says(call, "For orders, press 1. For returns and refunds, press 2.")
+    assert call.session.state is CallState.MENU
+    assert jev_events(call)[0].detail["choice"] == "menu"
+    await call.finish({"status": "completed"})
+
+
+async def test_jev_walks_menu_hold_person_then_stops(fake: FakeCartesia) -> None:
+    jev = MockDecisionClient()
+    for label in ("menu", "recorded_message", "human"):
+        jev.script(jev_checks.STATE_CHECK, label, 0.9)
+    call = await started_call(fake, jev)
+    await company_says(call, "For orders, press 1. For returns and refunds, press 2.")
+    assert call.session.state is CallState.MENU
+    await company_says(call, "Your call is important to us. Please continue to hold.")
+    assert call.session.state is CallState.RECORDED_MESSAGE
+    await company_says(call, "Hi, my name is Alex. How can I help you today?")
+    assert call.session.state is CallState.IN_CONVERSATION
+    assert [e.detail["choice"] for e in jev_events(call)] == ["menu", "recorded_message", "human"]
+    assert all(e.detail["question"] == jev_checks.STATE_CHECK for e in jev_events(call))
+    # With a person on the line the agent leads; Jev stops checking.
+    await company_says(call, "Press 1 if you want to hear that again.")
+    assert len(jev_events(call)) == 3 and call.session.state is CallState.IN_CONVERSATION
+    await call.finish({"status": "completed"})
+
+
+async def test_unsure_jev_leaves_the_state_alone(fake: FakeCartesia) -> None:
+    jev = MockDecisionClient()
+    jev.script(jev_checks.STATE_CHECK, "hold_music", 0.4)
+    jev.script(jev_checks.STATE_CHECK, "human", 0.7)  # under the stricter person bar
+    call = await started_call(fake, jev)
+    await company_says(call, "...")
+    await company_says(call, "Hello?")
+    assert call.session.state is CallState.DIALING
+    assert len(jev_events(call)) == 2
+    await call.finish({"status": "completed"})
+
+
+async def test_agent_report_that_contradicts_jev_is_logged(fake: FakeCartesia) -> None:
+    jev = MockDecisionClient()
+    jev.script(jev_checks.STATE_CHECK, "hold_music", 0.9)
+    call = await started_call(fake, jev)
+    await company_says(call, "(music)")
+    assert call.session.state is CallState.HOLD
+    await call.tool("report_state", {"state": "person", "note": ""})
+    assert call.session.state is CallState.IN_CONVERSATION  # the agent still moves it
+    (d,) = [e for e in call.recorder.events if e.kind == "jev_disagreement"]
+    assert d.detail == {"agent": "person", "jev": "hold_music", "probability": 0.9}
+    await call.tool("report_state", {"state": "hold", "note": ""})  # agrees: nothing new
+    assert len([e for e in call.recorder.events if e.kind == "jev_disagreement"]) == 1
+    await call.finish({"status": "completed"})
+
+
+async def test_menu_choice_asks_jev_for_the_key(fake: FakeCartesia) -> None:
+    jev = MockDecisionClient()
+    jev.script(jev_checks.MENU_CHOICE, "2", 0.91)
+    call = await started_call(fake, jev)
+    q = hub.subscribe(call.id)
+    reply = await call.tool(
+        "menu_choice", {"options": "1: orders\n2: returns and refunds\n0: representative"}
+    )
+    assert reply == "Press 2 with send_dtmf (returns and refunds)."
+    (question, options, context) = jev.calls[-1]
+    assert question == jev_checks.MENU_CHOICE and options == ["1", "2", "0"]
+    assert context["goal"] == call.session.goal
+    (event,) = [e for e in jev_events(call) if e.detail["question"] == jev_checks.MENU_CHOICE]
+    assert event.detail["choice"] == "2" and event.confidence == 0.91
+    shown = [
+        m.data["text"] for m in [q.get_nowait() for _ in range(q.qsize())] if m.type == "summary"
+    ]
+    assert shown == ["Jev: Press 2 (returns and refunds), 91% sure"]
+    hub.unsubscribe(call.id, q)
+    await call.finish({"status": "completed"})
+
+
+async def test_menu_choice_heuristic_and_unsure_answers(fake: FakeCartesia) -> None:
+    call = await started_call(fake)  # keyword twin: goal words decide
+    reply = await call.tool("menu_choice", {"options": "1: orders; 2: returns and refunds"})
+    assert reply.startswith("Press 2 with send_dtmf")
+    jev = MockDecisionClient()
+    jev.script(jev_checks.MENU_CHOICE, "say:representative", 0.3)
+    unsure = await started_call(fake, jev)
+    reply = await unsure.tool(
+        "menu_choice", {"options": "billing: a bill\nrepresentative: someone"}
+    )
+    assert reply.startswith('Say "representative" to the menu') and "not sure" in reply
+    await call.finish({"status": "completed"})
+    await unsure.finish({"status": "completed"})
+
+
+async def test_menu_choice_can_act_on_one_eligible_option(fake: FakeCartesia) -> None:
+    jev = MockDecisionClient()
+    jev.script(jev_checks.MENU_CHOICE, "2", 0.96)
+    call = await started_call(fake, jev)
+    try:
+        # A complete key/label pair is enough; no whole-menu/end-of-menu gate.
+        reply = await call.tool("menu_choice", {"options": "2: returns and refunds"})
+        assert reply == "Press 2 with send_dtmf (returns and refunds)."
+        assert jev.calls[-1][1] == ["2"]
+    finally:
+        await call.finish({"status": "completed"})
+
+
+async def test_menu_choice_falls_back_to_captions_and_skips_callbacks(fake: FakeCartesia) -> None:
+    jev = MockDecisionClient()
+    jev.script(jev_checks.STATE_CHECK, "callback_offer", 0.9)
+    call = await started_call(fake, jev)
+    await company_says(call, "To get a callback, press 1. To keep holding, press 2.")
+    await call.tool("menu_choice", {"options": ""})
+    (_, options, _) = jev.calls[-1]
+    assert options == ["2"]  # read from the captions; the callback key is never offered
+    await call.finish({"status": "completed"})
+
+
+def test_agent_menu_lines_parse_keys_and_spoken_words() -> None:
+    assert _agent_menu("1: orders\nPress 2: refunds; say billing: bills\nnonsense") == {
+        "1": "orders",
+        "2": "refunds",
+        "say:billing": "bills",
+    }
+
+
+def test_agent_menu_commas_separate_keys_but_preserve_label_commas() -> None:
+    assert _agent_menu(
+        "2: billing, invoices and late fees, Press 3: technical support, "
+        "*: hear options again, #: main menu"
+    ) == {
+        "2": "billing, invoices and late fees",
+        "3": "technical support",
+        "*": "hear options again",
+        "#": "main menu",
+    }
+    assert _agent_menu("billing: bills, fees and payments, say representative: a person") == {
+        "say:billing": "bills, fees and payments",
+        "say:representative": "a person",
+    }
+
+
+async def test_comma_separated_menu_does_not_hide_later_matching_key(fake: FakeCartesia) -> None:
+    jev = MockDecisionClient()
+    call = await started_call(fake, jev)
+    try:
+        reply = await call.tool("menu_choice", {"options": "1: sales, 2: returns and refunds"})
+        assert reply.startswith("Press 2 with send_dtmf")
+        _, keys, context = jev.calls[-1]
+        assert keys == ["1", "2"]
+        assert context["option_descriptions"] == {"1": "sales", "2": "returns and refunds"}
+    finally:
+        await call.finish({"status": "completed"})
 
 
 # --- HTTP endpoints --------------------------------------------------------------------

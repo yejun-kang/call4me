@@ -3,7 +3,8 @@
 Cartesia handles the phone line, listening, speaking, and turn-taking; Claude (via
 Cartesia's managed models) decides what to say. Our server stays in the loop
 through webhook tools (ask the user, check an offer against the user's limits,
-report progress, record the outcome) and the per-turn call webhook (captions).
+pick a menu option with Jev, report progress, record the outcome) and the per-turn
+call webhook (captions, plus a Jev state check on each company utterance).
 
 Per-call facts arrive as dynamic variables, filled when we start the call.
 """
@@ -37,9 +38,12 @@ silently, invoke skip_turn with no spoken text; never say its name.
 <known_info>{{known_info}}</known_info>
 
 Part 1: the automated phone system.
-- When a menu lists options, pick the one that best fits the goal and press it with \
-send_dtmf (or say it, if the menu asks you to speak). Prefer reaching a live person. \
-Call call4me_report_state with state "menu".
+- When a menu lists options, call call4me_menu_choice with the options you heard. \
+Jev returns the key to press (or word to say): follow it with send_dtmf (or say it, \
+if the menu asks you to speak). Only if the result says it is not sure and another \
+option clearly fits the goal better, choose that one; prefer reaching a live person. \
+Call call4me_report_state with state "menu" and a note the customer will read, \
+giving the key and why. Keep that explanation in the note, never in spoken text.
 - During automated menus, use tools silently. Speak only if the system requests \
 a spoken response.
 - When asked to enter digits using the keypad, use send_dtmf, never read the digits \
@@ -184,6 +188,22 @@ def tool_specs(base_url: str, secret: str) -> list[dict[str, Any]]:
                 },
             },
             ["kind", "description", "amount_usd"],
+        ),
+        tool(
+            "menu_choice",
+            "Ask Jev which menu option fits the goal using the options heard so far. Returns "
+            "the key to press or the word to say. Silent: say nothing while calling it.",
+            {
+                "options": {
+                    "type": "string",
+                    "description": "Options you heard, one per line as key: label, "
+                    "e.g. '1: orders' then '2: returns and refunds' then '0: "
+                    "representative'. If the menu asks you to speak, use the word to say "
+                    "as the key, e.g. 'billing: questions about a bill'.",
+                },
+            },
+            ["options"],
+            timeout=5,
         ),
         tool(
             "report_state",

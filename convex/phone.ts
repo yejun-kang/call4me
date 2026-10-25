@@ -1,5 +1,6 @@
 import { httpAction } from "./_generated/server";
 import { internal } from "./_generated/api";
+import { chooseMenu, parseMenuOptions } from "./jev";
 
 const CARTESIA = "https://api.cartesia.ai";
 const VERSION = "2026-08-14";
@@ -217,6 +218,7 @@ export const webhook = httpAction(async (ctx, request) => {
     const caption = redact(turn.text);
     if (caption) await ctx.runMutation(internal.managed.caption, {
       session_id, speaker: turn.role === "assistant" ? "agent" : "remote", text: caption,
+      ...(typeof turn.id === "string" ? { turn_id: turn.id } : typeof event.id === "string" ? { turn_id: event.id } : {}),
     });
   } else if (kind === "call_completed" || kind === "call_failed") {
     const call = event.call || {};
@@ -242,7 +244,26 @@ export const tool = httpAction(async (ctx, request) => {
   if (!managed || ["ENDED", "FAILED"].includes(managed.call.state))
     return new Response("This call is no longer active. Wrap up politely.");
   let result = "noted";
-  if (name === "report_state") {
+  if (name === "menu_choice") {
+    const context = await ctx.runQuery(internal.managed.jevContext, { session_id });
+    if (!context) return new Response("This call is no longer active. Wrap up politely.");
+    const options = parseMenuOptions(redact(args.options), context.transcript);
+    if (!Object.keys(options).length) result = "Could not read the options. Pick the one that best fits the goal yourself.";
+    else {
+      const decision = await chooseMenu({ goal: context.goal, options, transcript: context.transcript });
+      const label = options[decision.choice] || "";
+      const spoken = decision.choice.startsWith("say:");
+      const word = decision.choice.slice(4);
+      const action = spoken ? `Say "${word}" to the menu` : `Press ${decision.choice} with send_dtmf`;
+      const shown = spoken ? `Say "${word}"` : `Press ${decision.choice}`;
+      const recorded = await ctx.runMutation(internal.managed.jevRecord, { session_id, decision,
+        sequence: context.sequence, state_version: context.state_version,
+        reason: "menu: which option?", summary: `${decision.source === "jev" ? "Jev" : "Fallback"}: ${shown} (${label}), ${Math.round(decision.probability * 100)}% sure` });
+      if (!recorded) return new Response("The call changed while selecting this menu option. Do not send these tones. Continue from what the company is saying now; request a new menu choice if needed.");
+      result = `${action} (${label}).` + (decision.probability < 0.5
+        ? " Jev is not sure: if another option clearly fits the goal better, choose that one instead." : "");
+    }
+  } else if (name === "report_state") {
     const target = ({ menu: "MENU", hold: "HOLD", person: "IN_CONVERSATION" } as Record<string, string>)[text(args.state)];
     if (target) await ctx.runMutation(internal.managed.transition, { session_id, to: target, reason: redact(args.note) || `agent: ${args.state}` });
   } else if (name === "finish") {

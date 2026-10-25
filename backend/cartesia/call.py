@@ -6,7 +6,10 @@ Cartesia dials the company from our Cartesia number and runs the conversation
 - the call webhook: every utterance (`call_turn`) becomes a live caption, and
   `call_completed` / `call_failed` wrap the call up;
 - webhook tools the agent calls: ask the user (they type), check an offer against
-  the user's limits, report where the call is, record the outcome.
+  the user's limits, pick a menu option, report where the call is, record the outcome;
+- Jev: every company utterance is classified (menu, hold, person, ...) to drive the
+  call state, and Jev picks the menu key when the agent asks (`menu_choice`). The
+  agent (Claude Haiku on Cartesia) does the talking; Jev makes the fast typed calls.
 
 Same surface as `calls.LiveCall` (takeover, handback, type_text, cancel, ...), so
 the API endpoints and dashboard don't care which one runs a call.
@@ -22,6 +25,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
+from collections import deque
 from typing import Any
 
 from backend.agent.guard import looks_high_sensitivity
@@ -41,12 +46,15 @@ from backend.contracts import (
     CallEvent,
     CallSession,
     CallState,
+    DecisionClient,
+    JevDecision,
     LiveMessage,
     Sensitivity,
     UserRequest,
     UserRequestStatus,
     utcnow,
 )
+from backend.engine import jev_checks, menu
 from backend.engine import states as st
 from backend.notify.live import hub
 
@@ -70,7 +78,64 @@ END_REASONS = {
 }
 STATUS_POLL_S = 15.0  # backup to the webhook: notice a finished call even if events are lost
 
+# Jev state labels we act on. Voicemail and call_ended are left to Cartesia, which ends
+# the call itself (the webhook wraps up); silence changes nothing.
+JEV_TO_STATE = {
+    "menu": S.MENU,
+    "recorded_message": S.RECORDED_MESSAGE,
+    "hold_music": S.HOLD,
+    "callback_offer": S.CALLBACK_OFFERED,
+    "human": S.IN_CONVERSATION,
+}
+# What the agent's report_state would say for each Jev label, to spot disagreements.
+JEV_TO_REPORT = {
+    "menu": "menu",
+    "recorded_message": "hold",
+    "hold_music": "hold",
+    "callback_offer": "hold",
+    "human": "person",
+}
+JEV_STATE_THRESHOLD = 0.6  # same bar as the phone-mode engine
+# Higher than the engine's: there is no greeting/response check here, and a false
+# "person" stops the watch until the agent reports hold again.
+JEV_HUMAN_THRESHOLD = 0.75
+JEV_MENU_SURE = 0.5  # below this the agent is told Jev is unsure
+JEV_TIMEOUT_S = 2.0  # then keyword heuristics answer (jev_checks fallback)
+REMOTE_WINDOW = 4  # recent company utterances Jev sees
+
+_MENU_LINE = re.compile(r"^\s*(?:press\s+)?([^:]+?)\s*:\s*(.+?)\s*$", re.IGNORECASE)
+_DIGITS = re.compile(r"^[0-9*#]+$")
+
 by_call_id: dict[str, CartesiaCall] = {}
+
+
+def _decision_client(settings: Any) -> DecisionClient:
+    """Jev with a key; keyword heuristics without one or with mocks (like phone mode)."""
+    key = getattr(settings, "typesafe_api_key", "") or ""
+    if getattr(settings, "use_mocks", False) or not key:
+        return jev_checks.MockDecisionClient()
+    return jev_checks.JevDecisionClient(api_key=key)
+
+
+def _agent_menu(text: str) -> dict[str, str]:
+    """The agent's 'key: label' lines -> action key -> label. Non-digit keys are words
+    to say ("representative: talk to someone")."""
+    options: dict[str, str] = {}
+    # Models sometimes return comma-separated key/label pairs despite the line
+    # format. Split only before another key, preserving commas inside labels.
+    for line in re.split(
+        r"[\n;]|,\s*(?=(?:press\s+)?(?:[0-9*#]+|(?:say\s+)?[a-z][a-z'-]*)\s*:)",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        m = _MENU_LINE.match(line)
+        if not m:
+            continue
+        key, label = m.group(1).strip().lower(), m.group(2).strip()
+        if not _DIGITS.match(key):
+            key = menu.SAY_PREFIX + key.removeprefix("say").strip()
+        options.setdefault(key, label)
+    return options
 
 
 def _limits_text(session: CallSession) -> str:
@@ -97,6 +162,7 @@ class CartesiaCall:
         settings: Any,
         known_info: dict[str, str] | None = None,
         api: CartesiaAgentsApi | None = None,
+        decisions: DecisionClient | None = None,
         persist: bool = True,
     ) -> None:
         self.session = session
@@ -117,6 +183,11 @@ class CartesiaCall:
         self.outcome: str | None = None
         self.reference: str | None = None
         self._messages: list[str] = []  # typed by the user, for the agent to say
+        self.decisions = decisions or _decision_client(settings)
+        self._remote: deque[str] = deque(maxlen=REMOTE_WINDOW)  # redacted company speech
+        self._jev_lock = asyncio.Lock()  # FIFO: checks apply in the order speech arrived
+        self._jev_count = 0
+        self._jev_last: JevDecision | None = None
         self._tasks: set[asyncio.Task[Any]] = set()
         self._finished = asyncio.Event()
         self._finishing = False
@@ -192,6 +263,58 @@ class CartesiaCall:
         self.transcript.append(f"{speaker}: {text}")
         if self.persist:
             await self._event("caption", {"speaker": speaker, "text": text}, audit_action=None)
+        if speaker == "remote":
+            self._remote.append(text)
+            # Off the webhook's path: Cartesia shouldn't wait on Jev.
+            self._spawn(self._jev_watch(text))
+
+    # ------------------------------------------------------------- Jev
+
+    async def _jev_watch(self, latest: str) -> None:
+        """Classify the company's latest speech and move the call state on a confident
+        answer. Only before a person answers; after that the agent's reports lead."""
+        async with self._jev_lock:
+            if self._finishing or self.session.state not in PRE_PERSON:
+                return
+            d = await jev_checks.classify_state(
+                self.decisions,
+                transcript=" ".join(self._remote),
+                latest=latest,
+                audio_label=None,
+                current_state=self.session.state,
+                timeout_s=JEV_TIMEOUT_S,
+            )
+            self._jev_last = d
+            await self._record_jev(d, "new company speech")
+            target = JEV_TO_STATE.get(d.choice)
+            bar = JEV_HUMAN_THRESHOLD if target is S.IN_CONVERSATION else JEV_STATE_THRESHOLD
+            if (
+                target is None
+                or d.probability < bar
+                or target is self.session.state
+                or self._finishing
+                or self.session.state not in PRE_PERSON
+            ):
+                return
+            await self._go(target, f"jev: {d.choice}", actor="jev", confidence=d.probability)
+
+    async def _record_jev(self, d: JevDecision, reason: str) -> None:
+        # Same shape as the phone-mode engine's, so the judges view shows both alike.
+        self._jev_count += 1
+        await self._event(
+            "jev_decision",
+            {
+                "question": d.question,
+                "choice": d.choice,
+                "probability": round(d.probability, 3),
+                "count": self._jev_count,
+                "state": self.session.state.value,
+                "reason": reason,
+                "fallback": "fallback" in d.alternatives,
+            },
+            confidence=d.probability,
+            audit_action="jev.decision",
+        )
 
     # ------------------------------------------------------------- tools
 
@@ -199,6 +322,7 @@ class CartesiaCall:
         handler = {
             "ask_user": self._ask_user,
             "check_offer": self._check_offer,
+            "menu_choice": self._menu_choice,
             "report_state": self._report_state,
             "finish": self._finish_tool,
         }.get(name)
@@ -339,13 +463,64 @@ class CartesiaCall:
         await self._deny(kind, f"{why} ({audit.redact(what)})")
         return f"Not allowed: {why}. Politely decline and steer back to the goal."
 
-    async def _report_state(self, args: dict[str, Any]) -> str:
-        target = {"menu": S.MENU, "hold": S.HOLD, "person": S.IN_CONVERSATION}.get(
-            str(args.get("state") or "")
+    async def _menu_choice(self, args: dict[str, Any]) -> str:
+        heard = " ".join(self._remote)
+        # The agent's list is structured; our own parse of the captions is the backup.
+        options = _agent_menu(str(args.get("options") or "")) or menu.parse_menu_options(heard)
+        if not options:
+            return "Could not read the options. Pick the one that best fits the goal yourself."
+        # Never accept a callback by pressing through it, unless that's all there is.
+        options = menu.decline_callback_options(options) or options
+        d = await jev_checks.choose_menu_option(
+            self.decisions,
+            goal=self.session.goal,
+            menu_options=options,
+            transcript=heard,
+            timeout_s=JEV_TIMEOUT_S,
         )
+        await self._record_jev(d, "menu: which option?")
+        label = audit.redact(options.get(d.choice, ""))
+        if d.choice.startswith(menu.SAY_PREFIX):
+            word = d.choice.removeprefix(menu.SAY_PREFIX)
+            action, shown = f'Say "{word}" to the menu', f'Say "{word}"'
+        else:
+            action, shown = f"Press {d.choice} with send_dtmf", f"Press {d.choice}"
+        hub.publish(
+            LiveMessage(
+                type="summary",
+                session_id=self.id,
+                data={"text": f"Jev: {shown} ({label}), {round(d.probability * 100)}% sure"},
+            )
+        )
+        if d.probability < JEV_MENU_SURE:
+            return (
+                f"{action} ({label}). Jev is not sure: if another option clearly fits the "
+                "goal better, choose that one instead."
+            )
+        return f"{action} ({label})."
+
+    async def _report_state(self, args: dict[str, Any]) -> str:
+        reported = str(args.get("state") or "")
+        target = {"menu": S.MENU, "hold": S.HOLD, "person": S.IN_CONVERSATION}.get(reported)
+        last = self._jev_last
+        if (
+            target is not None
+            and last is not None
+            and last.probability >= JEV_STATE_THRESHOLD
+            and JEV_TO_REPORT.get(last.choice, reported) != reported
+        ):
+            # The agent has heard everything (and knows what it pressed), so it still
+            # moves the state; the timeline shows where Jev saw it differently.
+            await self._event(
+                "jev_disagreement",
+                {"agent": reported, "jev": last.choice, "probability": round(last.probability, 3)},
+            )
         note = audit.redact(str(args.get("note") or ""))[:200]
         if target is not None:
             await self._go(target, note or f"agent: {args.get('state')}")
+        if note and target is S.MENU:
+            # Why it chose that key: on the customer's screen ("What's happening"), not spoken.
+            hub.publish(LiveMessage(type="summary", session_id=self.id, data={"text": note}))
         return "noted"
 
     async def _finish_tool(self, args: dict[str, Any]) -> str:
@@ -454,6 +629,9 @@ class CartesiaCall:
                 task.cancel()
         with contextlib.suppress(Exception):
             await self.api.aclose()
+        if (close := getattr(self.decisions, "aclose", None)) is not None:
+            with contextlib.suppress(Exception):
+                await close()
 
     async def _fail(self, reason: str) -> None:
         with contextlib.suppress(st.IllegalTransition):
@@ -497,7 +675,14 @@ class CartesiaCall:
 
     # ------------------------------------------------------------- helpers
 
-    async def _go(self, target: CallState, reason: str) -> None:
+    async def _go(
+        self,
+        target: CallState,
+        reason: str,
+        *,
+        actor: str = "agent",
+        confidence: float | None = None,
+    ) -> None:
         """Walk to `target` through legal states (e.g. menu -> person passes through
         HUMAN_SUSPECTED and HUMAN_CONFIRMED, so the timeline reads like the engine's)."""
         path = [target]
@@ -511,13 +696,23 @@ class CartesiaCall:
         for state in path:
             try:
                 await st.transition(
-                    self.session, state, reason=reason, recorder=self.recorder, actor="agent"
+                    self.session,
+                    state,
+                    reason=reason,
+                    recorder=self.recorder,
+                    actor=actor,
+                    confidence=confidence,
                 )
             except st.IllegalTransition:
                 return
 
     async def _event(
-        self, kind: str, detail: dict[str, Any], *, audit_action: str | None = None
+        self,
+        kind: str,
+        detail: dict[str, Any],
+        *,
+        confidence: float | None = None,
+        audit_action: str | None = None,
     ) -> None:
         try:
             await self.recorder.event(
@@ -526,6 +721,7 @@ class CartesiaCall:
                     kind=kind,
                     from_state=self.session.state,
                     to_state=self.session.state,
+                    confidence=confidence,
                     detail=detail,
                 ),
                 audit_action=audit_action,
